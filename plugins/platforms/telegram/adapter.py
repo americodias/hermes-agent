@@ -6157,6 +6157,18 @@ class TelegramAdapter(BasePlatformAdapter):
             )
             return
 
+        # --- Email-manager per-item approval callbacks (em:verb:ref[:action]) ---
+        if data.startswith("em:"):
+            await self._handle_email_manager_callback(
+                query,
+                data,
+                query_chat_id=query_chat_id,
+                query_chat_type=query_chat_type,
+                query_thread_id=query_thread_id,
+                query_user_name=query_user_name,
+            )
+            return
+
         # --- Exec approval callbacks (ea:choice:id) ---
         if data.startswith("ea:"):
             parts = data.split(":", 2)
@@ -6609,6 +6621,123 @@ class TelegramAdapter(BasePlatformAdapter):
                 await query.edit_message_text(text=appended, reply_markup=None)
         except Exception:
             pass
+
+    # Closed `em:` callback contract for email-manager per-item approvals.
+    # Canonical contract: email-manager repo, docs/decisions/ws-t-telegram-approvals.md
+    # ("em: callback payload contract"), minted by email_manager.control
+    # encode_email_callback and mirrored — never re-parsed loosely — here. Any
+    # payload outside the closed grammar decodes to None and is dropped before
+    # the plugin is ever invoked.
+    _EM_CALLBACK_MAX_BYTES = 64
+    _EM_PROPOSAL_REF = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+    _EM_APPROVAL_ACTIONS = frozenset(
+        {"archive", "mark_read", "archive_document", "unsubscribe_oneclick"}
+    )
+
+    @classmethod
+    def _decode_email_callback(cls, data) -> Optional[tuple]:
+        """Decode closed `em:` callback_data into fixed /email argv, or None.
+
+        Mirrors email_manager.control.decode_email_callback: fail-closed on
+        non-string, oversized, wrong prefix, unknown verb, wrong arity, or a
+        reference/action outside the closed grammar. A successful decode is
+        exactly the argv of the equivalent typed command (`/email tg-approve
+        <ref> <action>` / `/email tg-dismiss <ref>`), so the button and text
+        paths cannot diverge.
+        """
+        if not isinstance(data, str):
+            return None
+        if len(data.encode("utf-8")) > cls._EM_CALLBACK_MAX_BYTES:
+            return None
+        parts = data.split(":")
+        if len(parts) < 3 or parts[0] != "em":
+            return None
+        verb = parts[1]
+        if verb == "approve":
+            if len(parts) != 4:
+                return None
+            ref, action = parts[2], parts[3]
+            if not cls._EM_PROPOSAL_REF.fullmatch(ref):
+                return None
+            if action not in cls._EM_APPROVAL_ACTIONS:
+                return None
+            return ("tg-approve", ref, action)
+        if verb == "dismiss":
+            if len(parts) != 3:
+                return None
+            ref = parts[2]
+            if not cls._EM_PROPOSAL_REF.fullmatch(ref):
+                return None
+            return ("tg-dismiss", ref)
+        return None
+
+    async def _handle_email_manager_callback(
+        self,
+        query,
+        data: str,
+        *,
+        query_chat_id,
+        query_chat_type,
+        query_thread_id,
+        query_user_name,
+    ) -> None:
+        """Dispatch an email-manager approval callback (em:verb:ref[:action]).
+
+        The press is only a carrier for the closed /email grammar: decode
+        fail-closed, authenticate the presser with the same check as ea:/gt:
+        callbacks, then dispatch the email-manager-operator plugin with argv
+        identical to the typed command — never through the model loop.
+        """
+        argv = self._decode_email_callback(data)
+        if argv is None:
+            await query.answer(text="Invalid email approval data.")
+            return
+
+        caller_id = str(getattr(query.from_user, "id", ""))
+        if not self._is_callback_user_authorized(
+            caller_id,
+            chat_id=query_chat_id,
+            chat_type=str(query_chat_type) if query_chat_type is not None else None,
+            thread_id=str(query_thread_id) if query_thread_id is not None else None,
+            user_name=query_user_name,
+        ):
+            await query.answer(text="⛔ You are not authorized to act on this proposal.")
+            return
+
+        try:
+            from hermes_cli.plugins import get_plugin_command_handler
+            plugin_handler = get_plugin_command_handler("email")
+        except Exception:
+            plugin_handler = None
+        if not callable(plugin_handler):
+            await query.answer(text="❌ email-manager-operator plugin unavailable")
+            logger.error(
+                "[%s] email callback dropped: /email plugin command not registered",
+                self.name,
+            )
+            return
+
+        raw_args = " ".join(argv)
+        try:
+            # The plugin handler runs a bounded subprocess synchronously; keep
+            # it off the event loop.
+            result = await asyncio.to_thread(plugin_handler, raw_args)
+            if asyncio.iscoroutine(result):
+                result = await result
+            label = str(result).strip() if result else "Done."
+            logger.info(
+                "[%s] email callback dispatched: /email %s", self.name, raw_args,
+            )
+        except Exception as exc:
+            label = "❌ email command failed"
+            logger.error(
+                "[%s] email callback exception: args=%s err=%s",
+                self.name, raw_args, exc, exc_info=True,
+            )
+
+        # answerCallbackQuery caps text at 200 chars; the plugin result is
+        # already bounded, human-readable text.
+        await query.answer(text=label[:200])
 
     def _missing_media_path_error(self, label: str, path: str) -> str:
         """Build an actionable file-not-found error for gateway MEDIA delivery.
